@@ -1,0 +1,352 @@
+// ==UserScript==
+// @name         GitHub Ultimate Enhancement Suite SUPER VERSION (iPhone + Desktop)
+// @namespace    https://github.com/
+// @version      3.0.0
+// @description  Super GitHub enhancement suite: download files, folders, repo ZIP, clone, CDN download, repo size, mobile toolbox, iPhone Safari optimized, and full UI enhancements.
+// @author       SUPER VERSION
+// @match        https://github.com/*
+// @match        https://gist.github.com/*
+// @grant        GM_setClipboard
+// @connect      api.github.com
+// @run-at       document-idle
+// ==/UserScript==
+
+(function() {
+"use strict";
+
+////////////////////////////////////////////////////////
+// ENVIRONMENT DETECTION
+////////////////////////////////////////////////////////
+
+const MOBILE = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+////////////////////////////////////////////////////////
+// GLOBAL STYLE
+////////////////////////////////////////////////////////
+
+const style = document.createElement("style");
+
+style.textContent = `
+
+.container-xl, .container-lg, .container-md {
+ max-width: 100% !important;
+}
+
+.gh-btn {
+ background:#2ea44f;
+ color:white;
+ padding:6px 10px;
+ border-radius:6px;
+ margin-left:6px;
+ font-size:12px;
+ cursor:pointer;
+}
+
+.gh-mobile-box {
+ position:fixed;
+ bottom:20px;
+ right:10px;
+ z-index:999999;
+ display:flex;
+ flex-direction:column;
+ gap:10px;
+}
+
+.gh-mobile-btn {
+ background:#2ea44f;
+ color:white;
+ padding:14px;
+ border-radius:10px;
+ font-size:16px;
+ text-align:center;
+}
+
+.gh-size {
+ color:#888;
+ font-size:11px;
+ margin-left:6px;
+}
+
+`;
+
+document.head.appendChild(style);
+
+////////////////////////////////////////////////////////
+// HELPER FUNCTIONS
+////////////////////////////////////////////////////////
+
+function getRepoInfo() {
+
+ const parts = location.pathname.split("/");
+
+ if(parts.length < 3) return null;
+
+ return {
+
+  owner: parts[1],
+  repo: parts[2]
+
+ };
+
+}
+
+function rawURL(url) {
+
+ return url.replace("/blob/","/raw/");
+
+}
+
+function cdnURL(owner, repo, path) {
+
+ return `https://cdn.jsdelivr.net/gh/${owner}/${repo}@HEAD/${path}`;
+
+}
+
+function formatSize(bytes) {
+
+ if(bytes>1024*1024*1024)
+  return (bytes/1024/1024/1024).toFixed(2)+" GB";
+
+ if(bytes>1024*1024)
+  return (bytes/1024/1024).toFixed(2)+" MB";
+
+ if(bytes>1024)
+  return (bytes/1024).toFixed(2)+" KB";
+
+ return bytes+" B";
+
+}
+
+////////////////////////////////////////////////////////
+// DOWNLOAD BUTTONS
+////////////////////////////////////////////////////////
+
+function addFileButtons() {
+
+ const repo = getRepoInfo();
+ if(!repo) return;
+
+ document.querySelectorAll('[role="row"]').forEach(row=>{
+
+  if(row.querySelector(".gh-btn")) return;
+
+  const link=row.querySelector('a[href*="/blob/"]');
+  if(!link) return;
+
+  const path=link.getAttribute("title");
+
+  const raw=rawURL(link.href);
+  const cdn=cdnURL(repo.owner, repo.repo, path);
+
+  row.appendChild(makeButton("Download",raw));
+
+  row.appendChild(makeButton("CDN",cdn));
+
+  row.appendChild(makeButton("Copy URL",()=>{
+
+   navigator.clipboard.writeText(raw);
+
+  }));
+
+ });
+
+}
+
+function makeButton(text,action){
+
+ const btn=document.createElement("span");
+
+ btn.className="gh-btn";
+ btn.innerText=text;
+
+ if(typeof action==="string")
+  btn.onclick=()=>location.href=action;
+ else
+  btn.onclick=action;
+
+ return btn;
+
+}
+
+////////////////////////////////////////////////////////
+// REPO ZIP BUTTON
+////////////////////////////////////////////////////////
+
+function addRepoButtons(){
+
+ const repo=getRepoInfo();
+ if(!repo) return;
+
+ if(document.querySelector(".gh-repo-buttons")) return;
+
+ const box=document.createElement("div");
+ box.className="gh-repo-buttons";
+
+ const zip=`https://github.com/${repo.owner}/${repo.repo}/archive/refs/heads/main.zip`;
+ const clone=`https://github.com/${repo.owner}/${repo.repo}.git`;
+
+ box.appendChild(makeButton("Download ZIP",zip));
+
+ box.appendChild(makeButton("Clone URL",()=>{
+
+  navigator.clipboard.writeText(clone);
+
+  alert("Clone URL copied");
+
+ }));
+
+ box.appendChild(makeButton("Open VS Code",`https://github.dev/${repo.owner}/${repo.repo}`));
+
+ document.querySelector("h1").appendChild(box);
+
+}
+
+////////////////////////////////////////////////////////
+// FILE SIZE VIEWER + REPO SIZE
+////////////////////////////////////////////////////////
+
+async function showSizes(){
+
+ const repo=getRepoInfo();
+ if(!repo) return;
+
+ const api=`https://api.github.com/repos/${repo.owner}/${repo.repo}/git/trees/HEAD?recursive=1`;
+
+ const res=await fetch(api);
+ const data=await res.json();
+
+ let total=0;
+
+ const map={};
+
+ data.tree.forEach(f=>{
+
+  map[f.path]=f.size;
+
+  total+=f.size||0;
+
+ });
+
+ document.querySelectorAll('[role="row"]').forEach(row=>{
+
+  const link=row.querySelector('a[href*="/blob/"]');
+
+  if(!link) return;
+
+  const path=link.getAttribute("title");
+
+  const size=map[path];
+
+  if(!size) return;
+
+  const label=document.createElement("span");
+
+  label.className="gh-size";
+  label.innerText=formatSize(size);
+
+  row.appendChild(label);
+
+ });
+
+ addRepoSizeLabel(total);
+
+}
+
+function addRepoSizeLabel(size){
+
+ if(document.querySelector(".gh-total-size")) return;
+
+ const label=document.createElement("span");
+
+ label.className="gh-total-size gh-btn";
+
+ label.innerText="Repo Size: "+formatSize(size);
+
+ document.querySelector("h1").appendChild(label);
+
+}
+
+////////////////////////////////////////////////////////
+// MOBILE TOOLBOX
+////////////////////////////////////////////////////////
+
+function mobileToolbox(){
+
+ if(!MOBILE) return;
+
+ if(document.querySelector(".gh-mobile-box")) return;
+
+ const repo=getRepoInfo();
+ if(!repo) return;
+
+ const box=document.createElement("div");
+ box.className="gh-mobile-box";
+
+ if(location.href.includes("/blob/")){
+
+  box.appendChild(makeMobileBtn("Download File",rawURL(location.href)));
+
+ }
+
+ box.appendChild(makeMobileBtn(
+  "Download Repo",
+  `https://github.com/${repo.owner}/${repo.repo}/archive/refs/heads/main.zip`
+ ));
+
+ box.appendChild(makeMobileBtn(
+  "Open github.dev",
+  `https://github.dev/${repo.owner}/${repo.repo}`
+ ));
+
+ box.appendChild(makeMobileBtn(
+  "Scroll Top",
+  ()=>window.scrollTo({top:0,behavior:"smooth"})
+ ));
+
+ document.body.appendChild(box);
+
+}
+
+function makeMobileBtn(text,action){
+
+ const btn=document.createElement("div");
+
+ btn.className="gh-mobile-btn";
+ btn.innerText=text;
+
+ if(typeof action==="string")
+  btn.onclick=()=>location.href=action;
+ else
+  btn.onclick=action;
+
+ return btn;
+
+}
+
+////////////////////////////////////////////////////////
+// OBSERVER
+////////////////////////////////////////////////////////
+
+const observer=new MutationObserver(()=>{
+
+ addFileButtons();
+ addRepoButtons();
+ mobileToolbox();
+
+});
+
+observer.observe(document.body,{
+ childList:true,
+ subtree:true
+});
+
+////////////////////////////////////////////////////////
+// INIT
+////////////////////////////////////////////////////////
+
+addFileButtons();
+addRepoButtons();
+mobileToolbox();
+showSizes();
+
+})();

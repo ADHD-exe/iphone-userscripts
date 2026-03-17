@@ -1,0 +1,377 @@
+// ==UserScript==
+// @name         Infinite Scroll
+// @namespace    local.hybrid.autopager
+// @version      1.0.0
+// @description  Infinite scroll by appending the next page. Auto-detects "next" link, supports per-site custom selectors, pause/resume, page counter, optional history updates, optional video pausing.
+// @match        *://*/*
+// @run-at       document-end
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
+// @grant        GM_xmlhttpRequest
+// @connect      *
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  // -----------------------------
+  // Settings / storage
+  // -----------------------------
+  const KEY = {
+    disabledHosts: 'hapl_disabledHosts',
+    paused: 'hapl_paused',
+    showCounter: 'hapl_showCounter',
+    updateHistory: 'hapl_updateHistory',
+    pauseVideos: 'hapl_pauseVideos',
+    perSiteRules: 'hapl_perSiteRules' // { "<host>": { contentSel, nextSel } }
+  };
+
+  const state = {
+    loading: false,
+    page: 1,
+    nextUrl: null,
+    stop: false,
+  };
+
+  const host = location.hostname;
+  const disabledHosts = new Set(GM_getValue(KEY.disabledHosts, []));
+  if (disabledHosts.has(host)) return;
+
+  let paused = GM_getValue(KEY.paused, false);
+  let showCounter = GM_getValue(KEY.showCounter, true);
+  let updateHistory = GM_getValue(KEY.updateHistory, true);
+  let pauseVideos = GM_getValue(KEY.pauseVideos, true);
+  let perSiteRules = GM_getValue(KEY.perSiteRules, {});
+
+  // -----------------------------
+  // UI: page counter
+  // -----------------------------
+  const counter = document.createElement('div');
+  counter.style.cssText = [
+    'position:fixed',
+    'right:12px',
+    'bottom:12px',
+    'z-index:2147483647',
+    'padding:6px 10px',
+    'border-radius:10px',
+    'font:12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
+    'background:rgba(0,0,0,0.65)',
+    'color:#fff',
+    'cursor:pointer',
+    'user-select:none'
+  ].join(';');
+  counter.title = 'Click to pause/resume';
+  counter.addEventListener('click', () => togglePaused());
+  document.documentElement.appendChild(counter);
+
+  function renderCounter() {
+    if (!showCounter) {
+      counter.style.display = 'none';
+      return;
+    }
+    counter.style.display = 'block';
+    counter.textContent = paused ? `⏸ Paused · Page ${state.page}` : `▶ Auto · Page ${state.page}`;
+  }
+
+  // -----------------------------
+  // Menus
+  // -----------------------------
+  let menuIds = [];
+  function regMenus() {
+    menuIds.forEach(id => { try { GM_unregisterMenuCommand(id); } catch {} });
+    menuIds = [];
+
+    menuIds.push(GM_registerMenuCommand(
+      disabledHosts.has(host) ? '❌ Disabled on this site (click to enable)' : '✅ Enabled (click to disable on this site)',
+      () => toggleDisableSite()
+    ));
+
+    menuIds.push(GM_registerMenuCommand(
+      paused ? '▶ Resume auto paging' : '⏸ Pause auto paging',
+      () => togglePaused()
+    ));
+
+    menuIds.push(GM_registerMenuCommand(
+      showCounter ? '✅ Page counter: ON' : '❌ Page counter: OFF',
+      () => { showCounter = !showCounter; GM_setValue(KEY.showCounter, showCounter); renderCounter(); regMenus(); }
+    ));
+
+    menuIds.push(GM_registerMenuCommand(
+      updateHistory ? '✅ Update URL/title/history: ON' : '❌ Update URL/title/history: OFF',
+      () => { updateHistory = !updateHistory; GM_setValue(KEY.updateHistory, updateHistory); regMenus(); }
+    ));
+
+    menuIds.push(GM_registerMenuCommand(
+      pauseVideos ? '✅ Pause videos on loaded pages: ON' : '❌ Pause videos on loaded pages: OFF',
+      () => { pauseVideos = !pauseVideos; GM_setValue(KEY.pauseVideos, pauseVideos); regMenus(); }
+    ));
+
+    menuIds.push(GM_registerMenuCommand(
+      '✍️ Set custom selectors for this site…',
+      () => setCustomRule()
+    ));
+
+    menuIds.push(GM_registerMenuCommand(
+      perSiteRules[host] ? '🗑 Remove custom selectors for this site' : '🗑 Remove custom selectors (none set)',
+      () => removeCustomRule()
+    ));
+
+    menuIds.push(GM_registerMenuCommand(
+      '⤵ Load next page now',
+      () => { if (!state.loading && state.nextUrl) loadNext(); }
+    ));
+
+    menuIds.push(GM_registerMenuCommand(
+      '⛔ Stop permanently (until refresh)',
+      () => { state.stop = true; }
+    ));
+  }
+
+  function toggleDisableSite() {
+    if (disabledHosts.has(host)) disabledHosts.delete(host);
+    else disabledHosts.add(host);
+    GM_setValue(KEY.disabledHosts, [...disabledHosts]);
+    location.reload();
+  }
+
+  function togglePaused() {
+    paused = !paused;
+    GM_setValue(KEY.paused, paused);
+    renderCounter();
+    regMenus();
+  }
+
+  function setCustomRule() {
+    const cur = perSiteRules[host] || {};
+    const contentSel = prompt(
+      'CSS selector for the MAIN content container to append (example: "article", ".post-list", "#content")',
+      cur.contentSel || ''
+    );
+    if (contentSel == null) return;
+
+    const nextSel = prompt(
+      'CSS selector for the NEXT link/button (example: "a[rel=next]", ".pagination .next a")',
+      cur.nextSel || ''
+    );
+    if (nextSel == null) return;
+
+    perSiteRules[host] = { contentSel: contentSel.trim(), nextSel: nextSel.trim() };
+    GM_setValue(KEY.perSiteRules, perSiteRules);
+    alert('Saved. Refresh the page to apply.');
+  }
+
+  function removeCustomRule() {
+    if (!perSiteRules[host]) return;
+    delete perSiteRules[host];
+    GM_setValue(KEY.perSiteRules, perSiteRules);
+    alert('Removed. Refresh the page to apply.');
+  }
+
+  // -----------------------------
+  // Detection helpers
+  // -----------------------------
+  function absUrl(url) {
+    try { return new URL(url, location.href).toString(); } catch { return null; }
+  }
+
+  function findNextUrl(doc) {
+    // 1) Per-site rule
+    const rule = perSiteRules[host];
+    if (rule?.nextSel) {
+      const a = doc.querySelector(rule.nextSel);
+      const href = a?.getAttribute?.('href') || a?.href;
+      const u = href ? absUrl(href) : null;
+      if (u) return u;
+    }
+
+    // 2) Standard rel=next
+    const linkRel = doc.querySelector('link[rel="next"][href]');
+    if (linkRel?.href) return absUrl(linkRel.href);
+
+    const aRel = doc.querySelector('a[rel="next"], a[rel="Next"], a[rel="NEXT"]');
+    if (aRel) {
+      const href = aRel.getAttribute('href') || aRel.href;
+      const u = href ? absUrl(href) : null;
+      if (u) return u;
+    }
+
+    // 3) Common "next" selectors
+    const candidates = [
+      'a.next',
+      'a[aria-label*="Next" i]',
+      'a[title*="Next" i]',
+      '.pagination a.next',
+      '.pagination a[rel="next"]',
+      'a:has(> span):not([href=""])'
+    ];
+    for (const sel of candidates) {
+      const el = doc.querySelector(sel);
+      if (!el) continue;
+      const href = el.getAttribute('href') || el.href;
+      const u = href ? absUrl(href) : null;
+      if (u) return u;
+    }
+
+    // 4) Text match fallback
+    const anchors = [...doc.querySelectorAll('a[href]')];
+    const textNext = /^(next|older|more|weiter|suivant|siguiente|次へ|下一页|下一頁|다음)$/i;
+    for (const a of anchors) {
+      const t = (a.textContent || '').trim().replace(/\s+/g, ' ');
+      if (!t || t.length > 20) continue;
+      if (!textNext.test(t)) continue;
+      const u = absUrl(a.getAttribute('href') || a.href);
+      if (u) return u;
+    }
+
+    return null;
+  }
+
+  function pickContentContainer(doc) {
+    // 1) Per-site rule
+    const rule = perSiteRules[host];
+    if (rule?.contentSel) {
+      const node = doc.querySelector(rule.contentSel);
+      if (node) return node;
+    }
+
+    // 2) Heuristics: article/main/content-ish
+    const heur = [
+      'main',
+      'article',
+      '#content',
+      '.content',
+      '#main',
+      '.main',
+      '.post',
+      '.posts',
+      '.entry',
+      '.entries',
+      '.thread',
+      '.topic',
+      '.result',
+      '.results'
+    ];
+    for (const sel of heur) {
+      const node = doc.querySelector(sel);
+      if (node && node.textContent && node.textContent.trim().length > 200) return node;
+    }
+
+    // 3) Fallback: body (last resort)
+    return doc.body;
+  }
+
+  function pauseAllVideos(root) {
+    if (!pauseVideos) return;
+    const vids = root.querySelectorAll?.('video') || [];
+    vids.forEach(v => {
+      try {
+        v.removeAttribute?.('autoplay');
+        v.muted = true;
+        v.pause?.();
+      } catch {}
+    });
+  }
+
+  // -----------------------------
+  // Loading + inserting
+  // -----------------------------
+  function request(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        responseType: 'text',
+        onload: (r) => resolve(r.responseText),
+        onerror: reject,
+        ontimeout: reject
+      });
+    });
+  }
+
+  function loadNext() {
+    if (paused || state.loading || state.stop || !state.nextUrl) return;
+    state.loading = true;
+
+    const url = state.nextUrl;
+    request(url).then(html => {
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+
+      const next = findNextUrl(doc);
+      const contentNode = pickContentContainer(doc);
+
+      // clone children into a wrapper to avoid moving nodes between documents
+      const wrap = document.createElement('div');
+      wrap.setAttribute('data-hapl-page', String(state.page + 1));
+      wrap.style.cssText = 'margin-top:16px;';
+      // append nodes
+      [...contentNode.childNodes].forEach(n => wrap.appendChild(document.importNode(n, true)));
+
+      // separator
+      const hr = document.createElement('hr');
+      hr.style.cssText = 'border:0;border-top:1px solid rgba(127,127,127,0.35);margin:18px 0;';
+      document.body.appendChild(hr);
+      document.body.appendChild(wrap);
+
+      pauseAllVideos(wrap);
+
+      state.page += 1;
+      state.nextUrl = next;
+      renderCounter();
+
+      if (updateHistory) {
+        try {
+          history.pushState({ hapl: true, page: state.page }, '', url);
+          if (doc.title) document.title = doc.title;
+        } catch {}
+      }
+
+      state.loading = false;
+    }).catch(() => {
+      state.loading = false;
+      state.stop = true;
+      counter.textContent = `⚠ Failed · Page ${state.page} (stopped)`;
+    });
+  }
+
+  // -----------------------------
+  // Scroll trigger
+  // -----------------------------
+  function nearBottom() {
+    const y = window.scrollY || document.documentElement.scrollTop || 0;
+    const h = window.innerHeight || document.documentElement.clientHeight || 0;
+    const docH = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+    return (y + h) > (docH - Math.max(800, h * 1.5));
+  }
+
+  function tick() {
+    if (!paused && !state.stop && !state.loading && state.nextUrl && nearBottom()) loadNext();
+    requestAnimationFrame(tick);
+  }
+
+  // -----------------------------
+  // Hotkeys
+  // -----------------------------
+  window.addEventListener('keydown', (e) => {
+    // Alt+P pause/resume
+    if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === 'p') {
+      e.preventDefault();
+      togglePaused();
+      return;
+    }
+    // Alt+N load next now
+    if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === 'n') {
+      e.preventDefault();
+      if (!state.loading && state.nextUrl) loadNext();
+    }
+  });
+
+  // -----------------------------
+  // Init
+  // -----------------------------
+  state.nextUrl = findNextUrl(document);
+  renderCounter();
+  regMenus();
+  tick();
+})();
